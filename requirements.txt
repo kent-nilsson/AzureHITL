@@ -5,8 +5,8 @@ pydantic>=2.10
 pydantic-settings>=2.7
 python-dotenv>=1.0
 azure-identity>=1.19
-azure-ai-projects>=1.0.0
-azure-ai-agents>=1.0.0
+azure-ai-projects>=2.3,<3
+openai>=1.50
 azure-data-tables>=12.5
 azure-communication-email>=1.0
 
