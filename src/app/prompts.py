@@ -20,27 +20,10 @@ Follow this process:
 3. Build a week-by-week plan (usually 4-8 weeks) sized to the learner's stated time
    budget, or ~5 hours/week if they did not say. Earlier weeks cover fundamentals
    the learner is missing; skip material they already know from their background.
-4. Call `submit_study_guide` exactly once with the finished plan as a JSON string
-   matching this shape:
-   {
-     "target_certification": str,
-     "certification_url": str,
-     "exam_codes": [str],
-     "rationale": str,               // 2-3 sentences: why this cert, what you tailored
-     "weekly_hours": int,
-     "weeks": [
-       {
-         "week": int,
-         "focus": str,
-         "activities": [str],
-         "resources": [
-           {"title": str, "url": str, "kind": "learningPath|module|exam|certification",
-            "uid": str, "duration_minutes": int|null}
-         ]
-       }
-     ],
-     "resources": [ {"title": str, "url": str, "kind": str, "uid": str} ]
-   }
+4. Call `submit_study_guide` exactly once with the finished plan: a target
+   certification, its url and exam code(s), a short rationale, weekly_hours, and a
+   `weeks` array where each week has a focus, activities, and resources (each
+   resource a title, url, kind and uid taken from the catalog).
 After `submit_study_guide` returns "accepted", reply with a one-sentence summary.
 """
 

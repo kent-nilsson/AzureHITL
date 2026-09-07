@@ -1,11 +1,17 @@
-"""Azure AI Foundry Agent Service integration.
+"""Microsoft Foundry study-guide generation.
 
-``run_study_guide`` runs a persistent Foundry agent that calls the
-``search_learn_catalog`` tool (backed by the Microsoft Learn Catalog API) and
-finishes by calling ``submit_study_guide`` with the structured plan.
+``run_study_guide`` drives a Foundry model deployment through the project's
+OpenAI-compatible client (``AIProjectClient.get_openai_client``), running a plain
+function-calling loop: the model calls ``search_learn_catalog`` (backed by the
+Microsoft Learn Catalog API) as many times as it needs, then finishes with
+``submit_study_guide`` carrying the structured plan.
 
-When ``FAKE_AGENT`` is set (local dev / CI) the whole Foundry round-trip is
-skipped and a plan is assembled directly from the catalog instead.
+With ``FAKE_AGENT`` set (or no ``PROJECT_ENDPOINT``) the Foundry round-trip is
+skipped and the plan is assembled directly from the catalog instead.
+
+This deliberately avoids the ``azure-ai-agents`` threads/runs surface, which has
+changed shape several times across SDK versions; the OpenAI chat-completions
+tool-call loop is stable.
 """
 
 from __future__ import annotations
@@ -13,17 +19,15 @@ from __future__ import annotations
 import json
 import logging
 import re
-from contextvars import ContextVar
 
 from .config import get_settings
 from .learn_catalog import get_catalog_client
 from .models import IntakeAnswers, StudyGuide, StudyResource, StudyWeek
-from .prompts import AGENT_INSTRUCTIONS, AGENT_NAME, INTAKE_TEMPLATE
+from .prompts import AGENT_INSTRUCTIONS, INTAKE_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
-# Collects the guide submitted by the agent during a single run.
-_run_ctx: ContextVar[dict] = ContextVar("study_guide_run_ctx")
+_MAX_TOOL_ROUNDS = 12
 
 _STOPWORDS = {
     "the", "and", "for", "with", "want", "become", "certification", "certified",
@@ -32,59 +36,112 @@ _STOPWORDS = {
 
 
 # ---------------------------------------------------------------------------
-# Tool functions (invoked by the agent, executed locally)
+# Tools exposed to the model
 # ---------------------------------------------------------------------------
-def search_learn_catalog(
-    type: str = "",
-    role: str = "",
-    product: str = "",
-    subject: str = "",
-    level: str = "",
-    uid: str = "",
-    q: str = "",
-) -> str:
-    """Search the Microsoft Learn catalog for real training content.
+_RESOURCE_PROPS = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "url": {"type": "string"},
+        "kind": {"type": "string", "description": "certification | exam | learningPath | module | other"},
+        "uid": {"type": "string"},
+        "duration_minutes": {"type": ["integer", "null"]},
+    },
+    "required": ["title", "url", "kind"],
+}
 
-    :param type: Comma-separated content types: certifications, mergedCertifications,
-        exams, learningPaths, modules, appliedSkills, courses.
-    :param role: Comma-separated job roles, e.g. "developer,solution-architect".
-    :param product: Comma-separated products, e.g. "azure,azure-functions".
-    :param subject: Comma-separated subject tags, e.g. "cloud-computing".
-    :param level: Comma-separated levels: beginner, intermediate, advanced.
-    :param uid: Comma-separated exact content uids to fetch.
-    :param q: Free-text filter matched against title, summary and skills.
-    :return: JSON array of matching catalog records.
-    """
+_STUDY_GUIDE_PARAMS = {
+    "type": "object",
+    "properties": {
+        "target_certification": {"type": "string"},
+        "certification_url": {"type": "string"},
+        "exam_codes": {"type": "array", "items": {"type": "string"}},
+        "rationale": {
+            "type": "string",
+            "description": "2-3 sentences: why this cert, what you tailored to the learner",
+        },
+        "weekly_hours": {"type": "integer"},
+        "weeks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "week": {"type": "integer"},
+                    "focus": {"type": "string"},
+                    "activities": {"type": "array", "items": {"type": "string"}},
+                    "resources": {"type": "array", "items": _RESOURCE_PROPS},
+                },
+                "required": ["week", "focus", "activities"],
+            },
+        },
+        "resources": {"type": "array", "items": _RESOURCE_PROPS},
+    },
+    "required": ["target_certification", "rationale", "weeks"],
+}
 
+
+def _search_learn_catalog(**kwargs: str) -> str:
     records = get_catalog_client().search(
-        type=type or None,
-        role=role or None,
-        product=product or None,
-        subject=subject or None,
-        level=level or None,
-        uid=uid or None,
-        q=q or None,
+        type=kwargs.get("type") or None,
+        role=kwargs.get("role") or None,
+        product=kwargs.get("product") or None,
+        subject=kwargs.get("subject") or None,
+        level=kwargs.get("level") or None,
+        uid=kwargs.get("uid") or None,
+        q=kwargs.get("q") or None,
     )
     return json.dumps(records, ensure_ascii=False)
 
 
-def submit_study_guide(payload_json: str) -> str:
-    """Submit the finished study guide for human approval.
+_TOOL_SPECS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_learn_catalog",
+            "description": (
+                "Search the Microsoft Learn catalog for real certifications, exams, "
+                "learning paths and modules. Multiple filters are AND-ed. Only cite "
+                "uids and urls this returns."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "description": "comma-separated: certifications, mergedCertifications, exams, learningPaths, modules",
+                    },
+                    "role": {"type": "string", "description": "comma-separated job roles, e.g. developer"},
+                    "product": {"type": "string", "description": "comma-separated products, e.g. azure,azure-functions"},
+                    "subject": {"type": "string", "description": "comma-separated subject tags"},
+                    "level": {"type": "string", "description": "beginner, intermediate or advanced"},
+                    "uid": {"type": "string", "description": "exact content uid(s), comma-separated"},
+                    "q": {"type": "string", "description": "free-text filter over title, summary and skills"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_study_guide",
+            "description": "Submit the finished study guide for human approval. Call exactly once, last.",
+            "parameters": _STUDY_GUIDE_PARAMS,
+        },
+    },
+]
 
-    :param payload_json: The full study guide as a JSON string.
-    :return: "accepted" once the guide validates.
-    """
 
-    data = json.loads(payload_json) if isinstance(payload_json, str) else payload_json
-    guide = StudyGuide.model_validate(data)
-    try:
-        _run_ctx.get()["guide"] = guide
-    except LookupError:  # called outside a managed run (shouldn't happen)
-        logger.warning("submit_study_guide called with no active run context")
-    return "accepted"
-
-
-_TOOLS = {search_learn_catalog, submit_study_guide}
+def _dispatch_tool(name: str, arguments: str, collector: dict) -> str:
+    args = json.loads(arguments) if arguments else {}
+    if name == "search_learn_catalog":
+        return _search_learn_catalog(**args)
+    if name == "submit_study_guide":
+        payload = args.get("payload_json", args)
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        collector["guide"] = StudyGuide.model_validate(payload)
+        return "accepted"
+    return f"error: unknown tool {name!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -95,75 +152,84 @@ def run_study_guide(answers: IntakeAnswers) -> StudyGuide:
     if settings.fake_agent or not settings.project_endpoint:
         logger.info("FAKE_AGENT active — building study guide from the catalog directly")
         return _fake_guide(answers)
-
-    token = _run_ctx.set({"guide": None})
-    try:
-        _run_foundry_agent(answers)
-        guide = _run_ctx.get()["guide"]
-    finally:
-        _run_ctx.reset(token)
-
-    if guide is None:
-        raise RuntimeError("Agent finished without calling submit_study_guide")
-    return guide
+    return _run_foundry(answers)
 
 
 # ---------------------------------------------------------------------------
-# Foundry Agent Service
+# Microsoft Foundry
 # ---------------------------------------------------------------------------
-def _run_foundry_agent(answers: IntakeAnswers) -> None:
-    from azure.ai.agents.models import FunctionTool, ToolSet
+def _run_foundry(answers: IntakeAnswers) -> StudyGuide:
     from azure.ai.projects import AIProjectClient
     from azure.identity import DefaultAzureCredential
 
     settings = get_settings()
-    project = AIProjectClient(
-        endpoint=settings.project_endpoint, credential=DefaultAzureCredential()
-    )
-
-    with project:
-        agents = project.agents
-        toolset = ToolSet()
-        toolset.add(FunctionTool(_TOOLS))
-        agents.enable_auto_function_calls(toolset)
-
-        agent_id = settings.agent_id or _ensure_agent(agents, toolset)
-        thread = agents.threads.create()
-        agents.messages.create(
-            thread_id=thread.id,
-            role="user",
-            content=INTAKE_TEMPLATE.format(
+    collector: dict = {}
+    messages: list[dict] = [
+        {"role": "system", "content": AGENT_INSTRUCTIONS},
+        {
+            "role": "user",
+            "content": INTAKE_TEMPLATE.format(
                 certificates=answers.certificates,
                 background=answers.background,
                 goal=answers.goal,
             ),
-        )
-        run = agents.runs.create_and_process(
-            thread_id=thread.id, agent_id=agent_id, toolset=toolset
-        )
-        logger.info("Foundry run %s finished: %s", run.id, run.status)
-        if run.status == "failed":
-            raise RuntimeError(f"Agent run failed: {run.last_error}")
+        },
+    ]
+
+    with DefaultAzureCredential() as credential, AIProjectClient(
+        endpoint=settings.project_endpoint, credential=credential
+    ) as project:
+        openai_client = project.get_openai_client()
+
+        for round_no in range(_MAX_TOOL_ROUNDS):
+            completion = openai_client.chat.completions.create(
+                model=settings.model_deployment_name,
+                messages=messages,
+                tools=_TOOL_SPECS,
+                tool_choice="auto",
+            )
+            choice = completion.choices[0].message
+            entry: dict = {"role": "assistant", "content": choice.content or ""}
+            if choice.tool_calls:
+                entry["tool_calls"] = [tc.model_dump() for tc in choice.tool_calls]
+            messages.append(entry)
+
+            if not choice.tool_calls:
+                break
+
+            for tc in choice.tool_calls:
+                try:
+                    result = _dispatch_tool(tc.function.name, tc.function.arguments, collector)
+                except Exception as exc:  # noqa: BLE001 — report back to the model
+                    logger.warning("tool %s failed: %s", tc.function.name, exc)
+                    result = f"error: {exc}"
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                )
+
+            if "guide" in collector:
+                break
+
+    guide = collector.get("guide") or _guide_from_text(messages)
+    if guide is None:
+        raise RuntimeError("Foundry model finished without producing a study guide")
+    logger.info("Foundry produced a plan for %s", guide.target_certification)
+    return guide
 
 
-def _ensure_agent(agents, toolset) -> str:
-    """Reuse an agent named AGENT_NAME if it exists, else create one."""
+def _guide_from_text(messages: list[dict]) -> StudyGuide | None:
+    """Last resort: pull a JSON study guide out of the final assistant message."""
 
-    try:
-        for existing in agents.list_agents():
-            if existing.name == AGENT_NAME:
-                return existing.id
-    except Exception:  # noqa: BLE001 — listing is best-effort
-        logger.debug("Could not list existing agents; creating a new one")
-
-    settings = get_settings()
-    agent = agents.create_agent(
-        model=settings.model_deployment_name,
-        name=AGENT_NAME,
-        instructions=AGENT_INSTRUCTIONS,
-        toolset=toolset,
-    )
-    return agent.id
+    for entry in reversed(messages):
+        if entry.get("role") != "assistant" or not entry.get("content"):
+            continue
+        text = entry["content"]
+        for candidate in re.findall(r"\{.*\}", text, re.DOTALL):
+            try:
+                return StudyGuide.model_validate_json(candidate)
+            except Exception:  # noqa: BLE001
+                continue
+    return None
 
 
 # ---------------------------------------------------------------------------

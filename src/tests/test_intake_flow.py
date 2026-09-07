@@ -75,6 +75,12 @@ def test_three_questions_asked_one_at_a_time(client):
     assert state["step"] == "ASK_GOAL"
     assert state["answers"]["background"] == "3 years as a Python developer"
 
+    # a resumed session carries the answered Q&A so the transcript reads cleanly
+    resumed = client.get(f"/api/session/{sid}").json()
+    texts = [t["text"] for t in resumed["history"]]
+    assert texts[1] == "AZ-900" and texts[3] == "3 years as a Python developer"
+    assert all(t["role"] in ("bot", "user") for t in resumed["history"])
+
 
 def test_full_flow_to_pending_then_approved(client, canned_guide, sent_emails):
     sid = client.post("/api/session", json={}).json()["session_id"]
@@ -90,12 +96,22 @@ def test_full_flow_to_pending_then_approved(client, canned_guide, sent_emails):
 
     guide_id = state["guide"]["guide_id"]
     token = approvals.sign(guide_id, "approve")
+
+    # GET is a safe confirmation page — it must NOT decide anything.
     r = client.get("/api/decision", params={"token": token})
+    assert r.status_code == 200
+    assert "confirm" in r.text.lower()
+    assert client.get(f"/api/guides/{guide_id}").json()["status"] == "PendingApproval"
+    assert sent_emails["learner"] == []
+
+    # The POST commits the decision.
+    r = client.post("/api/decision", data={"token": token, "comment": "Looks good"})
     assert r.status_code == 200
     assert "approved" in r.text.lower()
 
     g = client.get(f"/api/guides/{guide_id}").json()
     assert g["status"] == "Approved"
+    assert g["approver_comment"] == "Looks good"
     assert len(sent_emails["learner"]) == 1
 
     # session reflects the decision
@@ -111,10 +127,13 @@ def test_reused_link_returns_conflict(client, canned_guide, sent_emails):
     state = _answer(client, sid, "AZ-900 fundamentals")
     guide_id = state["guide"]["guide_id"]
 
-    client.get("/api/decision", params={"token": approvals.sign(guide_id, "approve")})
+    client.post("/api/decision", data={"token": approvals.sign(guide_id, "approve")})
+    # both the confirm page and a second commit must refuse
     r = client.get("/api/decision", params={"token": approvals.sign(guide_id, "reject")})
     assert r.status_code == 409
     assert "single-use" in r.text.lower()
+    r = client.post("/api/decision", data={"token": approvals.sign(guide_id, "reject")})
+    assert r.status_code == 409
 
 
 def test_message_after_intake_complete_is_rejected(client, canned_guide, sent_emails):

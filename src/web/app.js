@@ -7,9 +7,12 @@ const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 
 const SESSION_KEY = "study-planner-session";
+const INTAKE_STEPS = ["ASK_CERTS", "ASK_BACKGROUND", "ASK_GOAL"];
+
 let sessionId = null;
 let lastStep = null;
 let pollTimer = null;
+let typingEl = null;
 
 function addMessage(role, text) {
   const el = document.createElement("div");
@@ -26,6 +29,18 @@ function addGuide(markdown) {
   el.innerHTML = window.marked ? window.marked.parse(markdown) : `<pre>${markdown}</pre>`;
   chat.appendChild(el);
   chat.scrollTop = chat.scrollHeight;
+}
+
+function showTyping(text) {
+  clearTyping();
+  typingEl = addMessage("bot typing", text);
+}
+
+function clearTyping() {
+  if (typingEl) {
+    typingEl.remove();
+    typingEl = null;
+  }
 }
 
 function setBanner(kind, text) {
@@ -53,18 +68,19 @@ async function api(path, options) {
   return res.json();
 }
 
+function renderHistory(history) {
+  for (const turn of history || []) addMessage(turn.role, turn.text);
+}
+
 function render(state, opts = {}) {
   const step = state.step;
+  clearTyping();
 
-  if (["ASK_CERTS", "ASK_BACKGROUND", "ASK_GOAL"].includes(step)) {
+  if (INTAKE_STEPS.includes(step)) {
     if (step !== lastStep && state.prompt) addMessage("bot", state.prompt);
     setComposerEnabled(true);
   } else {
     setComposerEnabled(false);
-  }
-
-  if (step === "GENERATING") {
-    addMessage("bot typing", "Building your study guide from Microsoft Learn…");
   }
 
   if (state.guide && (opts.forceGuide || step !== lastStep)) {
@@ -100,7 +116,7 @@ function startPolling(guideId) {
       const g = await api(`/api/guides/${guideId}`);
       if (g.status !== "PendingApproval") {
         stopPolling();
-        render({ step: "PENDING_APPROVAL", prompt: null, answers: {}, guide: g }, { forceGuide: false });
+        render({ step: "PENDING_APPROVAL", prompt: null, guide: g });
       }
     } catch (err) {
       console.warn("poll failed", err);
@@ -122,6 +138,9 @@ form.addEventListener("submit", async (e) => {
   addMessage("user", text);
   input.value = "";
   setComposerEnabled(false);
+  const finishing = lastStep === "ASK_GOAL";
+  if (finishing) showTyping("Building your study guide from Microsoft Learn — this can take a moment…");
+
   try {
     const state = await api("/api/message", {
       method: "POST",
@@ -129,6 +148,7 @@ form.addEventListener("submit", async (e) => {
     });
     render(state);
   } catch (err) {
+    clearTyping();
     addMessage("bot", `⚠️ ${err.message}`);
     setComposerEnabled(true);
   }
@@ -140,18 +160,39 @@ form.addEventListener("submit", async (e) => {
   } catch (_) {
     sessionId = null;
   }
+
+  let state;
   try {
-    const state = await api("/api/session", {
+    state = await api("/api/session", {
       method: "POST",
       body: JSON.stringify({ session_id: sessionId }),
     });
+
+    // Don't silently resume a half-finished intake (e.g. left over from an
+    // earlier failed attempt) — start clean. Only resume a fresh session or one
+    // that already has a guide to track.
+    const resumable = state.step === "ASK_CERTS" || state.guide;
+    if (!resumable) {
+      try {
+        localStorage.removeItem(SESSION_KEY);
+      } catch (_) {
+        /* ignore */
+      }
+      state = await api("/api/session", {
+        method: "POST",
+        body: JSON.stringify({ session_id: null }),
+      });
+    }
+
     sessionId = state.session_id;
     try {
       localStorage.setItem(SESSION_KEY, sessionId);
     } catch (_) {
       /* ignore */
     }
+
     addMessage("bot", "Hi! I'll build you a Microsoft certification study plan. A few quick questions first.");
+    renderHistory(state.history);
     render(state, { forceGuide: true });
   } catch (err) {
     addMessage("bot", `⚠️ Could not start a session: ${err.message}`);
