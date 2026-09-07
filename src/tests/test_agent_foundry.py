@@ -55,7 +55,7 @@ class _FakeProject:
     def __exit__(self, *_):
         return False
 
-    def get_openai_client(self):
+    def get_openai_client(self, **_kwargs):
         return self.openai
 
 
@@ -150,3 +150,22 @@ def test_raises_when_no_guide_produced(foundry):
 
     with pytest.raises(RuntimeError, match="without producing a study guide"):
         agent.run_study_guide(IntakeAnswers(certificates="x", background="y", goal="z"))
+
+
+def test_rate_limit_becomes_model_busy(foundry, monkeypatch):
+    import httpx
+    from openai import RateLimitError
+
+    holder = foundry([])
+
+    def _boom(**_):
+        raise RateLimitError(
+            "429 Too Many Requests",
+            response=httpx.Response(429, request=httpx.Request("POST", "https://x/chat")),
+            body=None,
+        )
+
+    monkeypatch.setattr(holder["project"].openai.chat.completions, "create", _boom)
+
+    with pytest.raises(agent.ModelBusyError):
+        agent.run_study_guide(IntakeAnswers(certificates="a", background="b", goal="c"))

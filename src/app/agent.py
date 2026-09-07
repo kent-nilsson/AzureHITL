@@ -27,7 +27,11 @@ from .prompts import AGENT_INSTRUCTIONS, INTAKE_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
-_MAX_TOOL_ROUNDS = 12
+_MAX_TOOL_ROUNDS = 8
+
+
+class ModelBusyError(RuntimeError):
+    """The Foundry model deployment is rate-limited; the caller should retry shortly."""
 
 _STOPWORDS = {
     "the", "and", "for", "with", "want", "become", "certification", "certified",
@@ -161,6 +165,7 @@ def run_study_guide(answers: IntakeAnswers) -> StudyGuide:
 def _run_foundry(answers: IntakeAnswers) -> StudyGuide:
     from azure.ai.projects import AIProjectClient
     from azure.identity import DefaultAzureCredential
+    from openai import APIConnectionError, APITimeoutError, RateLimitError
 
     settings = get_settings()
     collector: dict = {}
@@ -179,36 +184,46 @@ def _run_foundry(answers: IntakeAnswers) -> StudyGuide:
     with DefaultAzureCredential() as credential, AIProjectClient(
         endpoint=settings.project_endpoint, credential=credential
     ) as project:
-        openai_client = project.get_openai_client()
+        # max_retries: the OpenAI SDK backs off and honours Retry-After on 429s.
+        openai_client = project.get_openai_client(max_retries=4)
 
-        for round_no in range(_MAX_TOOL_ROUNDS):
-            completion = openai_client.chat.completions.create(
-                model=settings.model_deployment_name,
-                messages=messages,
-                tools=_TOOL_SPECS,
-                tool_choice="auto",
-            )
-            choice = completion.choices[0].message
-            entry: dict = {"role": "assistant", "content": choice.content or ""}
-            if choice.tool_calls:
-                entry["tool_calls"] = [tc.model_dump() for tc in choice.tool_calls]
-            messages.append(entry)
-
-            if not choice.tool_calls:
-                break
-
-            for tc in choice.tool_calls:
-                try:
-                    result = _dispatch_tool(tc.function.name, tc.function.arguments, collector)
-                except Exception as exc:  # noqa: BLE001 — report back to the model
-                    logger.warning("tool %s failed: %s", tc.function.name, exc)
-                    result = f"error: {exc}"
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+        try:
+            for _round in range(_MAX_TOOL_ROUNDS):
+                completion = openai_client.chat.completions.create(
+                    model=settings.model_deployment_name,
+                    messages=messages,
+                    tools=_TOOL_SPECS,
+                    tool_choice="auto",
                 )
+                choice = completion.choices[0].message
+                entry: dict = {"role": "assistant", "content": choice.content or ""}
+                if choice.tool_calls:
+                    entry["tool_calls"] = [tc.model_dump() for tc in choice.tool_calls]
+                messages.append(entry)
 
-            if "guide" in collector:
-                break
+                if not choice.tool_calls:
+                    break
+
+                for tc in choice.tool_calls:
+                    try:
+                        result = _dispatch_tool(
+                            tc.function.name, tc.function.arguments, collector
+                        )
+                    except Exception as exc:  # noqa: BLE001 — report back to the model
+                        logger.warning("tool %s failed: %s", tc.function.name, exc)
+                        result = f"error: {exc}"
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": result}
+                    )
+
+                if "guide" in collector:
+                    break
+        except (RateLimitError, APITimeoutError, APIConnectionError) as exc:
+            logger.warning("Foundry model unavailable: %s", exc)
+            raise ModelBusyError(
+                "The model is busy right now (rate limit). Wait about 20 seconds and "
+                "send your goal again."
+            ) from exc
 
     guide = collector.get("guide") or _guide_from_text(messages)
     if guide is None:
