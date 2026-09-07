@@ -136,6 +136,26 @@ def test_reused_link_returns_conflict(client, canned_guide, sent_emails):
     assert r.status_code == 409
 
 
+def test_model_busy_returns_503_and_lets_learner_retry(client, sent_emails, monkeypatch):
+    from app.agent import ModelBusyError
+
+    def _busy(_answers):
+        raise ModelBusyError("The model is busy (rate limit). Wait ~20s and try again.")
+
+    monkeypatch.setattr("app.main.run_study_guide", _busy)
+
+    sid = client.post("/api/session", json={}).json()["session_id"]
+    _answer(client, sid, "none")
+    _answer(client, sid, "new to Azure")
+    r = client.post("/api/message", json={"session_id": sid, "text": "AZ-900"})
+
+    assert r.status_code == 503
+    assert r.headers.get("retry-after") == "20"
+    assert "busy" in r.json()["detail"].lower()
+    # session bounced back to the goal step so the learner can resend
+    assert client.get(f"/api/session/{sid}").json()["step"] == "ASK_GOAL"
+
+
 def test_message_after_intake_complete_is_rejected(client, canned_guide, sent_emails):
     sid = client.post("/api/session", json={}).json()["session_id"]
     _answer(client, sid, "none")

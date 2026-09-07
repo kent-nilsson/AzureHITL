@@ -5,6 +5,7 @@ const banner = document.getElementById("banner");
 const form = document.getElementById("composer");
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
+const restartBtn = document.getElementById("restart");
 
 const SESSION_KEY = "study-planner-session";
 const INTAKE_STEPS = ["ASK_CERTS", "ASK_BACKGROUND", "ASK_GOAL"];
@@ -63,10 +64,25 @@ async function api(path, options) {
   });
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}));
-    throw new Error(detail.detail || res.statusText);
+    const err = new Error(detail.detail || res.statusText);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+restartBtn.addEventListener("click", () => {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch (_) {
+    /* ignore */
+  }
+  location.reload();
+});
 
 function renderHistory(history) {
   for (const turn of history || []) addMessage(turn.role, turn.text);
@@ -131,6 +147,32 @@ function stopPolling() {
   }
 }
 
+async function submitAnswer(text) {
+  if (lastStep === "ASK_GOAL") {
+    showTyping("Building your study guide from Microsoft Learn — this can take a moment…");
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const state = await api("/api/message", {
+        method: "POST",
+        body: JSON.stringify({ session_id: sessionId, text }),
+      });
+      render(state);
+      return;
+    } catch (err) {
+      if (err.status === 503 && attempt === 0) {
+        showTyping("The model is busy — retrying in 20 seconds…");
+        await sleep(20000);
+        continue;
+      }
+      clearTyping();
+      addMessage("bot", `⚠️ ${err.message}`);
+      setComposerEnabled(true);
+      return;
+    }
+  }
+}
+
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = input.value.trim();
@@ -138,20 +180,7 @@ form.addEventListener("submit", async (e) => {
   addMessage("user", text);
   input.value = "";
   setComposerEnabled(false);
-  const finishing = lastStep === "ASK_GOAL";
-  if (finishing) showTyping("Building your study guide from Microsoft Learn — this can take a moment…");
-
-  try {
-    const state = await api("/api/message", {
-      method: "POST",
-      body: JSON.stringify({ session_id: sessionId, text }),
-    });
-    render(state);
-  } catch (err) {
-    clearTyping();
-    addMessage("bot", `⚠️ ${err.message}`);
-    setComposerEnabled(true);
-  }
+  await submitAnswer(text);
 });
 
 (async function init() {

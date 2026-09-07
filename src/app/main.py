@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .agent import run_study_guide
+from .agent import ModelBusyError, run_study_guide
 from .approvals import (
     AlreadyDecidedError,
     ApprovalError,
@@ -206,6 +206,13 @@ def _generate_and_submit(session: SessionRecord) -> None:
     repo = get_repo()
     try:
         guide = run_study_guide(session.answers)
+    except ModelBusyError as exc:
+        logger.warning("Model busy for %s: %s", session.session_id, exc)
+        session.step = Step.ASK_GOAL
+        repo.put_session(session)
+        raise HTTPException(
+            status_code=503, detail=str(exc), headers={"Retry-After": "20"}
+        )
     except Exception:
         logger.exception("Study guide generation failed for %s", session.session_id)
         session.step = Step.ASK_GOAL  # let the learner retry the goal
