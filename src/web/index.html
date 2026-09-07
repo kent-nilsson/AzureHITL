@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Study Planner</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <h1>Study Planner</h1>
+      <p class="sub">Personalized Microsoft certification plans &mdash; with manager approval.</p>
+    </header>
+
+    <section id="chat" class="chat" aria-live="polite"></section>
+
+    <div id="banner" class="banner" hidden></div>
+
+    <form id="composer" class="composer" autocomplete="off">
+      <input id="input" type="text" placeholder="Type your answer&hellip;" aria-label="Your answer" />
+      <button id="send" type="submit">Send</button>
+    </form>
+  </main>
+</body>
+</html>

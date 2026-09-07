@@ -1,0 +1,12 @@
+{
+  "resourcesResourceGroups": "rg-",
+  "managedIdentityUserAssignedIdentities": "id-",
+  "operationalInsightsWorkspaces": "log-",
+  "insightsComponents": "appi-",
+  "storageStorageAccounts": "st",
+  "cognitiveServicesAccounts": "aif-",
+  "communicationServices": "acs-",
+  "communicationEmailServices": "acsemail-",
+  "webServerFarms": "plan-",
+  "webSitesAppService": "app-"
+}

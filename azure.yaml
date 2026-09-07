@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+name: study-planner-hitl
+metadata:
+  template: study-planner-hitl@0.1.0
+
+infra:
+  provider: bicep
+  path: infra
+  module: main
+
+services:
+  web:
+    project: .
+    language: py
+    host: appservice
+
+hooks:
+  preprovision:
+    posix:
+      shell: sh
+      run: |
+        if [ -z "$(azd env get-value APPROVAL_SIGNING_KEY 2>/dev/null)" ]; then
+          azd env set APPROVAL_SIGNING_KEY "$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+        fi
+        if [ -z "$(azd env get-value DEFAULT_APPROVER_EMAIL 2>/dev/null)" ]; then
+          echo "Set the approver (boss) e-mail first:  azd env set DEFAULT_APPROVER_EMAIL boss@contoso.com"
+          exit 1
+        fi
+    windows:
+      shell: pwsh
+      run: |
+        if (-not (azd env get-value APPROVAL_SIGNING_KEY 2>$null)) {
+          azd env set APPROVAL_SIGNING_KEY (python -c "import secrets;print(secrets.token_urlsafe(32))")
+        }
+        if (-not (azd env get-value DEFAULT_APPROVER_EMAIL 2>$null)) {
+          Write-Host "Set the approver (boss) e-mail first:  azd env set DEFAULT_APPROVER_EMAIL boss@contoso.com"
+          exit 1
+        }

@@ -1,0 +1,15 @@
+[project]
+name = "study-planner-hitl"
+version = "0.1.0"
+description = "Study Planner with Human-in-the-Loop — Azure AI demo"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["src/tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
